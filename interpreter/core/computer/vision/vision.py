@@ -19,7 +19,7 @@ class Vision:
         self.tokenizer = None  # Will load upon first use
         self.easyocr = None
 
-    def load(self, load_moondream=True, load_easyocr=True):
+    def load(self, load_moondream=False, load_easyocr=True):
         # print("Loading vision models (Moondream, EasyOCR)...\n")
 
         with contextlib.redirect_stdout(

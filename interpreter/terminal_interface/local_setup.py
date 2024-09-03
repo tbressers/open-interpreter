@@ -175,49 +175,9 @@ def local_setup(interpreter, provider=None, model=None):
             )
             return None
 
-    # START OF LOCAL MODEL PROVIDER LOGIC
-    interpreter.display_message(
-        "\n**Open Interpreter** supports multiple local model providers.\n"
-    )
-
-    # Define the choices for local models
-    choices = [
-        "Ollama",
-        "Llamafile",
-        "LM Studio",
-        "Jan",
-    ]
-
-    # Use inquirer to let the user select an option
-    questions = [
-        inquirer.List(
-            "model",
-            message="Select a provider",
-            choices=choices,
-        ),
-    ]
-    answers = inquirer.prompt(questions)
-
-    if answers == None:
-        exit()
-
-    selected_model = answers["model"]
+    selected_model = "LM Studio"
 
     if selected_model == "LM Studio":
-        interpreter.display_message(
-            """
-    To use Open Interpreter with **LM Studio**, you will need to run **LM Studio** in the background.
-
-    1. Download **LM Studio** from [https://lmstudio.ai/](https://lmstudio.ai/), then start it.
-    2. Select a language model then click **Download**.
-    3. Click the **<->** button on the left (below the chat button).
-    4. Select your model at the top, then click **Start Server**.
-
-
-    Once the server is running, you can begin your conversation below.
-
-    """
-        )
         interpreter.llm.supports_functions = False
         interpreter.llm.api_base = "http://localhost:1234/v1"
         interpreter.llm.api_key = "dummy"

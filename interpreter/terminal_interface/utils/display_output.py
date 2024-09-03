@@ -62,7 +62,7 @@ def display_output_cli(output):
             delete=False, suffix=".html", mode="w"
         ) as tmp_file:
             html = output["content"]
-            tmp_file.write(html)
+            tmp_file.write(html.encode('utf-8'))
             open_file(tmp_file.name)
     elif "format" in output and output["format"] == "javascript":
         with tempfile.NamedTemporaryFile(
