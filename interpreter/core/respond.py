@@ -1,12 +1,12 @@
 import json
 import os
 import re
+import time
 import traceback
 
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 import litellm
 
-from ..terminal_interface.utils.display_markdown_message import display_markdown_message
 from .render_message import render_message
 
 
@@ -75,6 +75,10 @@ def respond(interpreter):
 
         ### RUN THE LLM ###
 
+        assert (
+            len(interpreter.messages) > 0
+        ), "User message was not passed in. You need to pass in at least one message."
+
         if (
             interpreter.messages[-1]["type"] != "code"
         ):  # If it is, we should run the code (we do below)
@@ -83,7 +87,7 @@ def respond(interpreter):
                     yield {"role": "assistant", **chunk}
 
             except litellm.exceptions.BudgetExceededError:
-                display_markdown_message(
+                interpreter.display_message(
                     f"""> Max budget exceeded
 
                     **Session spend:** ${litellm._current_cost}
@@ -93,13 +97,16 @@ def respond(interpreter):
                 """
                 )
                 break
-            # Provide extra information on how to change API keys, if we encounter that error
-            # (Many people writing GitHub issues were struggling with this)
+
+                # Provide extra information on how to change API keys, if we encounter that error
+                # (Many people writing GitHub issues were struggling with this)
+
             except Exception as e:
+                error_message = str(e).lower()
                 if (
                     interpreter.offline == False
-                    and "auth" in str(e).lower()
-                    or "api key" in str(e).lower()
+                    and "auth" in error_message
+                    or "api key" in error_message
                 ):
                     output = traceback.format_exc()
                     raise Exception(
@@ -108,26 +115,35 @@ def respond(interpreter):
                 elif (
                     interpreter.offline == False and "not have access" in str(e).lower()
                 ):
-                    response = input(
-                        f"  You do not have access to {interpreter.llm.model}. You will need to add a payment method and purchase credits for the OpenAI API billing page (different from ChatGPT) to use `GPT-4`.\n\nhttps://platform.openai.com/account/billing/overview\n\nWould you like to try GPT-3.5-TURBO instead? (y/n)\n\n  "
-                    )
+                    """
+                    Check for invalid model in error message and then fallback.
+                    """
+                    if (
+                        "invalid model" in error_message
+                        or "model does not exist" in error_message
+                    ):
+                        provider_message = f"\n\nThe model '{interpreter.llm.model}' does not exist or is invalid. Please check the model name and try again.\n\nWould you like to try Open Interpreter's hosted `i` model instead? (y/n)\n\n  "
+                    elif "groq" in error_message:
+                        provider_message = f"\n\nYou do not have access to {interpreter.llm.model}. Please check with Groq for more details.\n\nWould you like to try Open Interpreter's hosted `i` model instead? (y/n)\n\n  "
+                    else:
+                        provider_message = f"\n\nYou do not have access to {interpreter.llm.model}. If you are using an OpenAI model, you may need to add a payment method and purchase credits for the OpenAI API billing page (this is different from ChatGPT Plus).\n\nhttps://platform.openai.com/account/billing/overview\n\nWould you like to try Open Interpreter's hosted `i` model instead? (y/n)\n\n"
+
+                    print(provider_message)
+
+                    response = input()
                     print("")  # <- Aesthetic choice
 
                     if response.strip().lower() == "y":
-                        interpreter.llm.model = "gpt-3.5-turbo-1106"
-                        interpreter.llm.context_window = 16000
-                        interpreter.llm.max_tokens = 4096
-                        interpreter.llm.supports_functions = True
-                        display_markdown_message(
-                            f"> Model set to `{interpreter.llm.model}`"
+                        interpreter.llm.model = "i"
+                        interpreter.display_message(f"> Model set to `i`")
+                        interpreter.display_message(
+                            "***Note:*** *Conversations with this model will be used to train our open-source model.*\n"
                         )
+
                     else:
-                        raise Exception(
-                            "\n\nYou will need to add a payment method and purchase credits for the OpenAI API billing page (different from ChatGPT) to use GPT-4.\n\nhttps://platform.openai.com/account/billing/overview"
-                        )
+                        raise
                 elif interpreter.offline and not interpreter.os:
-                    print(traceback.format_exc())
-                    raise Exception("Error occurred. " + str(e))
+                    raise
                 else:
                     raise
 
@@ -164,6 +180,19 @@ def respond(interpreter):
                     except:
                         pass
 
+                # print(code)
+                # print("---")
+                # time.sleep(2)
+
+                if code.strip().endswith("executeexecute"):
+                    code = code.replace("executeexecute", "")
+                    try:
+                        interpreter.messages[-1][
+                            "content"
+                        ] = code  # So the LLM can see it.
+                    except:
+                        pass
+
                 if code.replace("\n", "").replace(" ", "").startswith('{"language":'):
                     try:
                         code_dict = json.loads(code)
@@ -181,8 +210,8 @@ def respond(interpreter):
 
                 if code.replace("\n", "").replace(" ", "").startswith("{language:"):
                     try:
-                        code = code.replace("language: ", "'language': ").replace(
-                            "code: ", "'code': "
+                        code = code.replace("language: ", '"language": ').replace(
+                            "code: ", '"code": '
                         )
                         code_dict = json.loads(code)
                         if set(code_dict.keys()) == {"language", "code"}:
@@ -197,9 +226,19 @@ def respond(interpreter):
                     except:
                         pass
 
-                if language == "text" or language == "markdown":
+                if (
+                    language == "text"
+                    or language == "markdown"
+                    or language == "plaintext"
+                ):
                     # It does this sometimes just to take notes. Let it, it's useful.
                     # In the future we should probably not detect this behavior as code at all.
+                    real_content = interpreter.messages[-1]["content"]
+                    interpreter.messages[-1] = {
+                        "role": "assistant",
+                        "type": "message",
+                        "content": f"```\n{real_content}\n```",
+                    }
                     continue
 
                 # Is this language enabled/supported?
@@ -219,6 +258,16 @@ def respond(interpreter):
                         continue
                     else:
                         break
+
+                # Is there any code at all?
+                if code.strip() == "":
+                    yield {
+                        "role": "computer",
+                        "type": "console",
+                        "format": "output",
+                        "content": "Code block was empty. Please try again, be sure to write code before executing.",
+                    }
+                    continue
 
                 # Yield a message, such that the user can stop code execution if they want to
                 try:
@@ -281,15 +330,16 @@ def respond(interpreter):
                         computer_dict = interpreter.computer.to_dict()
                         if "_hashes" in computer_dict:
                             computer_dict.pop("_hashes")
-                        if computer_dict:
-                            computer_json = json.dumps(computer_dict)
-                            sync_code = f"""import json\ncomputer.load_dict(json.loads('''{computer_json}'''))"""
-                            interpreter.computer.run("python", sync_code)
+                        if "system_message" in computer_dict:
+                            computer_dict.pop("system_message")
+                        computer_json = json.dumps(computer_dict)
+                        sync_code = f"""import json\ncomputer.load_dict(json.loads('''{computer_json}'''))"""
+                        interpreter.computer.run("python", sync_code)
                 except Exception as e:
                     if interpreter.debug:
                         raise
                     print(str(e))
-                    print("Continuing...")
+                    print("Failed to sync iComputer with your Computer. Continuing...")
 
                 ## ↓ CODE IS RUN HERE
 
@@ -304,7 +354,15 @@ def respond(interpreter):
                         # sync up the interpreter's computer with your computer
                         result = interpreter.computer.run(
                             "python",
-                            "import json\ncomputer_dict = computer.to_dict()\nif computer_dict:\n  if '_hashes' in computer_dict:\n    computer_dict.pop('_hashes')\n  print(json.dumps(computer_dict))",
+                            """
+                            import json
+                            computer_dict = computer.to_dict()
+                            if '_hashes' in computer_dict:
+                                computer_dict.pop('_hashes')
+                            if "system_message" in computer_dict:
+                                computer_dict.pop("system_message")
+                            print(json.dumps(computer_dict))
+                            """,
                         )
                         result = result[-1]["content"]
                         interpreter.computer.load_dict(
@@ -314,7 +372,7 @@ def respond(interpreter):
                     if interpreter.debug:
                         raise
                     print(str(e))
-                    print("Continuing.")
+                    print("Failed to sync your Computer with iComputer. Continuing.")
 
                 # yield final "active_line" message, as if to say, no more code is running. unlightlight active lines
                 # (is this a good idea? is this our responsibility? i think so — we're saying what line of code is running! ...?)

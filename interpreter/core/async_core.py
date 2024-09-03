@@ -1,23 +1,42 @@
 import asyncio
 import json
 import os
+import shutil
 import socket
 import threading
 import time
 import traceback
+from collections import deque
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Union
+
+import shortuuid
+from pydantic import BaseModel
+from starlette.websockets import WebSocketState
 
 from .core import OpenInterpreter
 
 try:
     import janus
     import uvicorn
-    from fastapi import APIRouter, FastAPI, WebSocket
-    from fastapi.responses import PlainTextResponse
+    from fastapi import (
+        APIRouter,
+        FastAPI,
+        File,
+        Form,
+        HTTPException,
+        Request,
+        UploadFile,
+        WebSocket,
+    )
+    from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+    from starlette.status import HTTP_403_FORBIDDEN
 except:
     # Server dependencies are not required by the main package.
     pass
+
+
+complete_message = {"role": "server", "type": "status", "content": "complete"}
 
 
 class AsyncInterpreter(OpenInterpreter):
@@ -27,8 +46,14 @@ class AsyncInterpreter(OpenInterpreter):
         self.respond_thread = None
         self.stop_event = threading.Event()
         self.output_queue = None
+        self.unsent_messages = deque()
         self.id = os.getenv("INTERPRETER_ID", datetime.now().timestamp())
-        self.print = True  # Will print output
+        self.print = False  # Will print output
+
+        self.require_acknowledge = (
+            os.getenv("INTERPRETER_REQUIRE_ACKNOWLEDGE", "False").lower() == "true"
+        )
+        self.acknowledged_outputs = []
 
         self.server = Server(self)
 
@@ -52,7 +77,7 @@ class AsyncInterpreter(OpenInterpreter):
             run_code = None  # Will later default to auto_run unless the user makes a command here
 
             # But first, process any commands.
-            if self.messages[-1]["type"] == "command":
+            if self.messages[-1].get("type") == "command":
                 command = self.messages[-1]["content"]
                 self.messages = self.messages[:-1]
 
@@ -78,52 +103,103 @@ class AsyncInterpreter(OpenInterpreter):
         return await self.output_queue.async_q.get()
 
     def respond(self, run_code=None):
-        try:
-            if run_code == None:
-                run_code = self.auto_run
+        for attempt in range(5):  # 5 attempts
+            try:
+                if run_code == None:
+                    run_code = self.auto_run
 
-            for chunk_og in self._respond_and_store():
-                chunk = (
-                    chunk_og.copy()
-                )  # This fixes weird double token chunks. Probably a deeper problem?
+                sent_chunks = False
 
-                if chunk["type"] == "confirmation":
-                    if run_code:
-                        run_code = False
-                        continue
-                    else:
-                        break
+                for chunk_og in self._respond_and_store():
+                    chunk = (
+                        chunk_og.copy()
+                    )  # This fixes weird double token chunks. Probably a deeper problem?
 
-                if self.stop_event.is_set():
+                    if chunk["type"] == "confirmation":
+                        if run_code:
+                            run_code = False
+                            continue
+                        else:
+                            break
+
+                    if self.stop_event.is_set():
+                        return
+
+                    if self.print:
+                        if "start" in chunk:
+                            print("\n")
+                        if chunk["type"] in ["code", "console"] and "format" in chunk:
+                            if "start" in chunk:
+                                print(
+                                    "\n------------\n\n```" + chunk["format"],
+                                    flush=True,
+                                )
+                            if "end" in chunk:
+                                print("\n```\n\n------------\n\n", flush=True)
+                        if chunk.get("format") != "active_line":
+                            if "format" in chunk and "base64" in chunk["format"]:
+                                print("\n[An image was produced]")
+                            else:
+                                content = chunk.get("content", "")
+                                content = (
+                                    str(content)
+                                    .encode("ascii", "ignore")
+                                    .decode("ascii")
+                                )
+                                print(content, end="", flush=True)
+
+                    if self.debug:
+                        print("Interpreter produced this chunk:", chunk)
+
+                    self.output_queue.sync_q.put(chunk)
+                    sent_chunks = True
+
+                if not sent_chunks:
+                    print("ERROR. NO CHUNKS SENT. TRYING AGAIN.")
+                    print("Messages:", self.messages)
+                    messages = [
+                        "Hello? Answer please.",
+                        "Just say something, anything.",
+                        "Are you there?",
+                        "Can you respond?",
+                        "Please reply.",
+                    ]
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "type": "message",
+                            "content": messages[attempt % len(messages)],
+                        }
+                    )
+                    time.sleep(1)
+                else:
+                    self.output_queue.sync_q.put(complete_message)
+                    if self.debug:
+                        print("\nServer response complete.\n")
                     return
 
-                if self.print:
-                    if "start" in chunk:
-                        print("\n")
-                    if chunk["type"] in ["code", "console"] and "format" in chunk:
-                        if "start" in chunk:
-                            print("\n------------\n\n```" + chunk["format"], flush=True)
-                        if "end" in chunk:
-                            print("\n```\n\n------------\n\n", flush=True)
-                    if chunk.get("format") != "active_line":
-                        print(chunk.get("content", ""), end="", flush=True)
+            except Exception as e:
+                error = traceback.format_exc() + "\n" + str(e)
+                error_message = {
+                    "role": "server",
+                    "type": "error",
+                    "content": traceback.format_exc() + "\n" + str(e),
+                }
+                self.output_queue.sync_q.put(error_message)
+                self.output_queue.sync_q.put(complete_message)
+                print("\n\n--- SENT ERROR: ---\n\n")
+                print(error)
+                print("\n\n--- (ERROR ABOVE WAS SENT) ---\n\n")
+                return
 
-                self.output_queue.sync_q.put(chunk)
-
-            self.output_queue.sync_q.put(
-                {"role": "server", "type": "status", "content": "complete"}
-            )
-        except Exception as e:
-            error = traceback.format_exc() + "\n" + str(e)
-            error_message = {
-                "role": "server",
-                "type": "error",
-                "content": traceback.format_exc() + "\n" + str(e),
-            }
-            self.output_queue.sync_q.put(error_message)
-            print("\n\n--- SENT ERROR: ---\n\n")
-            print(error)
-            print("\n\n--- (ERROR ABOVE WAS SENT) ---\n\n")
+        error_message = {
+            "role": "server",
+            "type": "error",
+            "content": "No chunks sent or unknown error.",
+        }
+        self.output_queue.sync_q.put(error_message)
+        self.output_queue.sync_q.put(complete_message)
+        raise Exception("No chunks sent or unknown error.")
 
     def accumulate(self, chunk):
         """
@@ -137,21 +213,80 @@ class AsyncInterpreter(OpenInterpreter):
                 # We don't do anything with these.
                 pass
 
-            elif "start" in chunk:
+            elif "content" in chunk and not (
+                len(self.messages) > 0
+                and (
+                    (
+                        "type" in self.messages[-1]
+                        and chunk.get("type") != self.messages[-1].get("type")
+                    )
+                    or (
+                        "format" in self.messages[-1]
+                        and chunk.get("format") != self.messages[-1].get("format")
+                    )
+                )
+            ):
+                if len(self.messages) == 0:
+                    raise Exception(
+                        "You must send a 'start: True' chunk first to create this message."
+                    )
+                # Append to an existing message
+                if (
+                    "type" not in self.messages[-1]
+                ):  # It was created with a type-less start message
+                    self.messages[-1]["type"] = chunk["type"]
+                if (
+                    chunk.get("format") and "format" not in self.messages[-1]
+                ):  # It was created with a type-less start message
+                    self.messages[-1]["format"] = chunk["format"]
+                if "content" not in self.messages[-1]:
+                    self.messages[-1]["content"] = chunk["content"]
+                else:
+                    self.messages[-1]["content"] += chunk["content"]
+
+            # elif "content" in chunk and (len(self.messages) > 0 and self.messages[-1] == {'role': 'user', 'start': True}):
+            #     # Last message was {'role': 'user', 'start': True}. Just populate that with this chunk
+            #     self.messages[-1] = chunk.copy()
+
+            elif "start" in chunk or (
+                len(self.messages) > 0
+                and (
+                    chunk.get("type") != self.messages[-1].get("type")
+                    or chunk.get("format") != self.messages[-1].get("format")
+                )
+            ):
+                # Create a new message
                 chunk_copy = (
                     chunk.copy()
                 )  # So we don't modify the original chunk, which feels wrong.
-                chunk_copy.pop("start")
-                chunk_copy["content"] = ""
+                if "start" in chunk_copy:
+                    chunk_copy.pop("start")
+                if "content" not in chunk_copy:
+                    chunk_copy["content"] = ""
                 self.messages.append(chunk_copy)
-
-            elif "content" in chunk:
-                self.messages[-1]["content"] += chunk["content"]
 
         elif type(chunk) == bytes:
             if self.messages[-1]["content"] == "":  # We initialize as an empty string ^
                 self.messages[-1]["content"] = b""  # But it actually should be bytes
             self.messages[-1]["content"] += chunk
+
+
+def authenticate_function(key):
+    """
+    This function checks if the provided key is valid for authentication.
+
+    Returns True if the key is valid, False otherwise.
+    """
+    # Fetch the API key from the environment variables. If it's not set, return True.
+    api_key = os.getenv("INTERPRETER_API_KEY", None)
+
+    # If the API key is not set in the environment variables, return True.
+    # Otherwise, check if the provided key matches the fetched API key.
+    # Return True if they match, False otherwise.
+    if api_key is None:
+        return True
+    else:
+        return key == api_key
 
 
 def create_router(async_interpreter):
@@ -176,6 +311,7 @@ def create_router(async_interpreter):
                     <button>Send</button>
                 </form>
                 <button id="approveCodeButton">Approve Code</button>
+                <button id="authButton">Send Auth</button>
                 <div id="messages"></div>
                 <script>
                     var ws = new WebSocket("ws://"""
@@ -184,13 +320,32 @@ def create_router(async_interpreter):
             + str(async_interpreter.server.port)
             + """/");
                     var lastMessageElement = null;
+
                     ws.onmessage = function(event) {
+
+                        var eventData = JSON.parse(event.data);
+
+                        """
+            + (
+                """
+                        
+                        // Acknowledge receipt
+                        var acknowledge_message = {
+                            "ack": eventData.id
+                        };
+                        ws.send(JSON.stringify(acknowledge_message));
+
+                        """
+                if async_interpreter.require_acknowledge
+                else ""
+            )
+            + """
+
                         if (lastMessageElement == null) {
                             lastMessageElement = document.createElement('p');
                             document.getElementById('messages').appendChild(lastMessageElement);
                             lastMessageElement.innerHTML = "<br>"
                         }
-                        var eventData = JSON.parse(event.data);
 
                         if ((eventData.role == "assistant" && eventData.type == "message" && eventData.content) ||
                             (eventData.role == "computer" && eventData.type == "console" && eventData.format == "output" && eventData.content) ||
@@ -210,7 +365,7 @@ def create_router(async_interpreter):
                         } else {
                             var startMessageBlock = {
                                 "role": "user",
-                                "type": "message",
+                                //"type": "message",
                                 "start": true
                             };
                             ws.send(JSON.stringify(startMessageBlock));
@@ -224,7 +379,7 @@ def create_router(async_interpreter):
 
                             var endMessageBlock = {
                                 "role": "user",
-                                "type": "message",
+                                //"type": "message",
                                 "end": true
                             };
                             ws.send(JSON.stringify(endMessageBlock));
@@ -258,8 +413,15 @@ def create_router(async_interpreter):
                     };
                     ws.send(JSON.stringify(endCommandBlock));
                 }
+                function authenticate() {
+                    var authBlock = {
+                        "auth": "dummy-api-key"
+                    };
+                    ws.send(JSON.stringify(authBlock));
+                }
 
                 document.getElementById("approveCodeButton").addEventListener("click", approveCode);
+                document.getElementById("authButton").addEventListener("click", authenticate);
                 </script>
             </body>
             </html>
@@ -270,20 +432,51 @@ def create_router(async_interpreter):
     @router.websocket("/")
     async def websocket_endpoint(websocket: WebSocket):
         await websocket.accept()
-        try:
+
+        try:  # solving it ;)/ # killian super wrote this
 
             async def receive_input():
+                authenticated = False
                 while True:
                     try:
+                        if websocket.client_state != WebSocketState.CONNECTED:
+                            return
                         data = await websocket.receive()
 
-                        print("Received:", data)
+                        if (
+                            not authenticated
+                            and os.getenv("INTERPRETER_REQUIRE_AUTH") != "False"
+                        ):
+                            if "text" in data:
+                                data = json.loads(data["text"])
+                                if "auth" in data:
+                                    if async_interpreter.server.authenticate(
+                                        data["auth"]
+                                    ):
+                                        authenticated = True
+                                        await websocket.send_text(
+                                            json.dumps({"auth": True})
+                                        )
+                            if not authenticated:
+                                await websocket.send_text(json.dumps({"auth": False}))
+                            continue
 
-                        if data.get("type") == "websocket.receive" and "text" in data:
-                            data = json.loads(data["text"])
+                        if data.get("type") == "websocket.receive":
+                            if "text" in data:
+                                data = json.loads(data["text"])
+                                if (
+                                    async_interpreter.require_acknowledge
+                                    and "ack" in data
+                                ):
+                                    async_interpreter.acknowledged_outputs.append(
+                                        data["ack"]
+                                    )
+                                    continue
+                            elif "bytes" in data:
+                                data = data["bytes"]
                             await async_interpreter.input(data)
                         elif data.get("type") == "websocket.disconnect":
-                            print("Disconnecting.")
+                            print("Client wants to disconnect, that's fine..")
                             return
                         else:
                             print("Invalid data:", data)
@@ -296,101 +489,161 @@ def create_router(async_interpreter):
                             "type": "error",
                             "content": traceback.format_exc() + "\n" + str(e),
                         }
-                        await websocket.send_text(json.dumps(error_message))
-                        print("\n\n--- SENT ERROR: ---\n\n")
+                        if websocket.client_state == WebSocketState.CONNECTED:
+                            await websocket.send_text(json.dumps(error_message))
+                            await websocket.send_text(json.dumps(complete_message))
+                            print("\n\n--- SENT ERROR: ---\n\n")
+                        else:
+                            print(
+                                "\n\n--- ERROR (not sent due to disconnected state): ---\n\n"
+                            )
                         print(error)
-                        print("\n\n--- (ERROR ABOVE WAS SENT) ---\n\n")
+                        print("\n\n--- (ERROR ABOVE) ---\n\n")
 
             async def send_output():
                 while True:
+                    if websocket.client_state != WebSocketState.CONNECTED:
+                        return
                     try:
-                        output = await async_interpreter.output()
-                        # print("Attempting to send the following output:", output)
+                        # First, try to send any unsent messages
+                        while async_interpreter.unsent_messages:
+                            output = async_interpreter.unsent_messages[0]
+                            if async_interpreter.debug:
+                                print("This was unsent, sending it again:", output)
 
-                        for attempt in range(100):
-                            try:
-                                if isinstance(output, bytes):
-                                    await websocket.send_bytes(output)
-                                else:
-                                    await websocket.send_text(json.dumps(output))
-                                # print("Output sent successfully. Output was:", output)
-                                break
-                            except Exception as e:
-                                print(
-                                    "Failed to send output on attempt number:",
-                                    attempt + 1,
-                                    ". Output was:",
-                                    output,
-                                )
-                                print("Error:", str(e))
-                                await asyncio.sleep(0.05)
-                        else:
-                            raise Exception(
-                                "Failed to send after 100 attempts. Output was:",
-                                str(output),
-                            )
+                            success = await send_message(output)
+                            if success:
+                                async_interpreter.unsent_messages.popleft()
+
+                        # If we've sent all unsent messages, get a new output
+                        if not async_interpreter.unsent_messages:
+                            output = await async_interpreter.output()
+                            success = await send_message(output)
+                            if not success:
+                                async_interpreter.unsent_messages.append(output)
+                                if async_interpreter.debug:
+                                    print(
+                                        f"Added message to unsent_messages queue after failed attempts: {output}"
+                                    )
+
                     except Exception as e:
                         error = traceback.format_exc() + "\n" + str(e)
                         error_message = {
                             "role": "server",
                             "type": "error",
-                            "content": traceback.format_exc() + "\n" + str(e),
+                            "content": error,
                         }
-                        await websocket.send_text(json.dumps(error_message))
-                        print("\n\n--- SENT ERROR: ---\n\n")
+                        async_interpreter.unsent_messages.append(error_message)
+                        async_interpreter.unsent_messages.append(complete_message)
+                        print("\n\n--- ERROR (will be sent when possible): ---\n\n")
                         print(error)
-                        print("\n\n--- (ERROR ABOVE WAS SENT) ---\n\n")
+                        print(
+                            "\n\n--- (ERROR ABOVE WILL BE SENT WHEN POSSIBLE) ---\n\n"
+                        )
+
+            async def send_message(output):
+                if isinstance(output, dict) and "id" in output:
+                    id = output["id"]
+                else:
+                    id = shortuuid.uuid()
+                    if (
+                        isinstance(output, dict)
+                        and async_interpreter.require_acknowledge
+                    ):
+                        output["id"] = id
+
+                for attempt in range(20):
+                    # time.sleep(0.5)
+
+                    if websocket.client_state != WebSocketState.CONNECTED:
+                        return False
+
+                    try:
+                        # print("sending:", output)
+
+                        if isinstance(output, bytes):
+                            await websocket.send_bytes(output)
+                            return True  # Haven't set up ack for this
+                        else:
+                            if async_interpreter.require_acknowledge:
+                                output["id"] = id
+                            if async_interpreter.debug:
+                                print("Sending this over the websocket:", output)
+                            await websocket.send_text(json.dumps(output))
+
+                        if async_interpreter.require_acknowledge:
+                            acknowledged = False
+                            for _ in range(100):
+                                if id in async_interpreter.acknowledged_outputs:
+                                    async_interpreter.acknowledged_outputs.remove(id)
+                                    acknowledged = True
+                                    if async_interpreter.debug:
+                                        print("This output was acknowledged:", output)
+                                    break
+                                await asyncio.sleep(0.0001)
+
+                            if acknowledged:
+                                return True
+                            else:
+                                if async_interpreter.debug:
+                                    print("Acknowledgement not received for:", output)
+                                return False
+                        else:
+                            return True
+
+                    except Exception as e:
+                        print(
+                            f"Failed to send output on attempt number: {attempt + 1}. Output was: {output}"
+                        )
+                        print(f"Error: {str(e)}")
+                        traceback.print_exc()
+                        await asyncio.sleep(0.01)
+
+                # If we've reached this point, we've failed to send after 100 attempts
+                if output not in async_interpreter.unsent_messages:
+                    print("Failed to send message:", output)
+                else:
+                    print(
+                        "Failed to send message, also it was already in unsent queue???:",
+                        output,
+                    )
+
+                return False
 
             await asyncio.gather(receive_input(), send_output())
+
         except Exception as e:
-            try:
-                error = traceback.format_exc() + "\n" + str(e)
-                error_message = {
-                    "role": "server",
-                    "type": "error",
-                    "content": traceback.format_exc() + "\n" + str(e),
-                }
-                await websocket.send_text(json.dumps(error_message))
-                print("\n\n--- SENT ERROR: ---\n\n")
-                print(error)
-                print("\n\n--- (ERROR ABOVE WAS SENT) ---\n\n")
-            except:
-                # If we can't send it, that's fine.
-                pass
-        finally:
-            await websocket.close()
+            error = traceback.format_exc() + "\n" + str(e)
+            error_message = {
+                "role": "server",
+                "type": "error",
+                "content": error,
+            }
+            async_interpreter.unsent_messages.append(error_message)
+            async_interpreter.unsent_messages.append(complete_message)
+            print("\n\n--- ERROR (will be sent when possible): ---\n\n")
+            print(error)
+            print("\n\n--- (ERROR ABOVE WILL BE SENT WHEN POSSIBLE) ---\n\n")
 
     # TODO
     @router.post("/")
     async def post_input(payload: Dict[str, Any]):
-        # This doesn't work, but something like this should exist
-        query = payload.get("query")
-        if not query:
-            return {"error": "Query is required."}, 400
         try:
-            async_interpreter.input.put(query)
+            async_interpreter.input(payload)
             return {"status": "success"}
-        except Exception as e:
-            return {"error": str(e)}, 500
-
-    @router.post("/run")
-    async def run_code(payload: Dict[str, Any]):
-        language, code = payload.get("language"), payload.get("code")
-        if not (language and code):
-            return {"error": "Both 'language' and 'code' are required."}, 400
-        try:
-            print(f"Running {language}:", code)
-            output = async_interpreter.computer.run(language, code)
-            print("Output:", output)
-            return {"output": output}
         except Exception as e:
             return {"error": str(e)}, 500
 
     @router.post("/settings")
     async def set_settings(payload: Dict[str, Any]):
         for key, value in payload.items():
-            print(f"Updating settings: {key} = {value}")
+            print("Updating settings...")
+            # print(f"Updating settings: {key} = {value}")
             if key in ["llm", "computer"] and isinstance(value, dict):
+                if key == "auto_run":
+                    return {
+                        "error": f"The setting {key} is not modifiable through the server due to security constraints."
+                    }, 403
                 if hasattr(async_interpreter, key):
                     for sub_key, sub_value in value.items():
                         if hasattr(getattr(async_interpreter, key), sub_key):
@@ -419,60 +672,255 @@ def create_router(async_interpreter):
         else:
             return json.dumps({"error": "Setting not found"}), 404
 
+    if os.getenv("INTERPRETER_INSECURE_ROUTES", "").lower() == "true":
+
+        @router.post("/run")
+        async def run_code(payload: Dict[str, Any]):
+            language, code = payload.get("language"), payload.get("code")
+            if not (language and code):
+                return {"error": "Both 'language' and 'code' are required."}, 400
+            try:
+                print(f"Running {language}:", code)
+                output = async_interpreter.computer.run(language, code)
+                print("Output:", output)
+                return {"output": output}
+            except Exception as e:
+                return {"error": str(e)}, 500
+
+        @router.post("/upload")
+        async def upload_file(file: UploadFile = File(...), path: str = Form(...)):
+            try:
+                with open(path, "wb") as output_file:
+                    shutil.copyfileobj(file.file, output_file)
+                return {"status": "success"}
+            except Exception as e:
+                return {"error": str(e)}, 500
+
+        @router.get("/download/{filename}")
+        async def download_file(filename: str):
+            try:
+                return StreamingResponse(
+                    open(filename, "rb"), media_type="application/octet-stream"
+                )
+            except Exception as e:
+                return {"error": str(e)}, 500
+
+    ### OPENAI COMPATIBLE ENDPOINT
+
+    class ChatMessage(BaseModel):
+        role: str
+        content: Union[str, List[Dict[str, Any]]]
+
+    class ChatCompletionRequest(BaseModel):
+        model: str = "default-model"
+        messages: List[ChatMessage]
+        max_tokens: Optional[int] = None
+        temperature: Optional[float] = None
+        stream: Optional[bool] = False
+
+    async def openai_compatible_generator():
+        made_chunk = False
+
+        for message in [
+            ".",
+            "Just say something, anything.",
+            "Hello? Answer please.",
+            "Are you there?",
+            "Can you respond?",
+            "Please reply.",
+        ]:
+            for i, chunk in enumerate(
+                async_interpreter.chat(message=message, stream=True, display=True)
+            ):
+                made_chunk = True
+
+                if async_interpreter.stop_event.is_set():
+                    break
+
+                output_content = None
+
+                if chunk["type"] == "message" and "content" in chunk:
+                    output_content = chunk["content"]
+                if chunk["type"] == "code" and "start" in chunk:
+                    output_content = " "
+
+                if output_content:
+                    await asyncio.sleep(0)
+                    output_chunk = {
+                        "id": i,
+                        "object": "chat.completion.chunk",
+                        "created": time.time(),
+                        "model": "open-interpreter",
+                        "choices": [{"delta": {"content": output_content}}],
+                    }
+                    yield f"data: {json.dumps(output_chunk)}\n\n"
+
+            if made_chunk:
+                break
+
+    @router.post("/openai/chat/completions")
+    async def chat_completion(request: ChatCompletionRequest):
+        # Convert to LMC
+
+        async_interpreter.stop_event.set()
+
+        last_message = request.messages[-1]
+
+        if last_message.role != "user":
+            raise ValueError("Last message must be from the user.")
+
+        if last_message.content == "{STOP}":
+            # Handle special STOP token
+            return
+
+        if type(last_message.content) == str:
+            async_interpreter.messages.append(
+                {
+                    "role": "user",
+                    "type": "message",
+                    "content": last_message.content,
+                }
+            )
+            print(">", last_message.content)
+        elif type(last_message.content) == list:
+            for content in last_message.content:
+                if content["type"] == "text":
+                    async_interpreter.messages.append(
+                        {"role": "user", "type": "message", "content": str(content)}
+                    )
+                    print(">", content)
+                elif content["type"] == "image_url":
+                    if "url" not in content["image_url"]:
+                        raise Exception("`url` must be in `image_url`.")
+                    url = content["image_url"]["url"]
+                    print("> [user sent an image]", url[:100])
+                    if "base64," not in url:
+                        raise Exception(
+                            '''Image must be in the format: "data:image/jpeg;base64,{base64_image}"'''
+                        )
+
+                    # data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAA6oA...
+
+                    data = url.split("base64,")[1]
+                    format = "base64." + url.split(";")[0].split("/")[1]
+                    async_interpreter.messages.append(
+                        {
+                            "role": "user",
+                            "type": "image",
+                            "format": format,
+                            "content": data,
+                        }
+                    )
+
+        if os.getenv("INTERPRETER_SERVER_REQUIRE_START", False):
+            if last_message.content != "{START}":
+                return
+            if async_interpreter.messages[-1]["content"] == "{START}":
+                # Remove that {START} message that would have just been added
+                async_interpreter.messages = async_interpreter.messages[:-1]
+
+        async_interpreter.stop_event.clear()
+
+        if request.stream:
+            return StreamingResponse(
+                openai_compatible_generator(), media_type="application/x-ndjson"
+            )
+        else:
+            messages = async_interpreter.chat(message=".", stream=False, display=True)
+            content = messages[-1]["content"]
+            return {
+                "id": "200",
+                "object": "chat.completion",
+                "created": time.time(),
+                "model": request.model,
+                "choices": [{"message": {"role": "assistant", "content": content}}],
+            }
+
     return router
 
 
-host = os.getenv(
-    "HOST", "127.0.0.1"
-)  # IP address for localhost, used for local testing. To expose to local network, use 0.0.0.0
-port = int(os.getenv("PORT", 8000))  # Default port is 8000
-
-# FOR TESTING ONLY
-# host = "0.0.0.0"
-
-
 class Server:
-    def __init__(self, async_interpreter, host=host, port=port):
+    DEFAULT_HOST = "127.0.0.1"
+    DEFAULT_PORT = 8000
+
+    def __init__(self, async_interpreter, host=None, port=None):
         self.app = FastAPI()
         router = create_router(async_interpreter)
+        self.authenticate = authenticate_function
+
+        # Add authentication middleware
+        @self.app.middleware("http")
+        async def validate_api_key(request: Request, call_next):
+            # Ignore authentication for the /heartbeat route
+            if request.url.path == "/heartbeat":
+                return await call_next(request)
+
+            api_key = request.headers.get("X-API-KEY")
+            if self.authenticate(api_key):
+                response = await call_next(request)
+                return response
+            else:
+                return JSONResponse(
+                    status_code=HTTP_403_FORBIDDEN,
+                    content={"detail": "Authentication failed"},
+                )
+
         self.app.include_router(router)
-        self.host = host
-        self.port = port
+        h = host or os.getenv("HOST", Server.DEFAULT_HOST)
+        p = port or int(os.getenv("PORT", Server.DEFAULT_PORT))
+        self.config = uvicorn.Config(app=self.app, host=h, port=p)
+        self.uvicorn_server = uvicorn.Server(self.config)
 
-    def run(self, retries=5, *args, **kwargs):
-        print("SERVER STARTING")
+    @property
+    def host(self):
+        return self.config.host
 
-        if "host" in kwargs:
-            self.host = kwargs.pop("host")
-        if "port" in kwargs:
-            self.port = kwargs.pop("port")
-        if "app" in kwargs:
-            self.app = kwargs.pop("app")
+    @host.setter
+    def host(self, value):
+        self.config.host = value
+        self.uvicorn_server = uvicorn.Server(self.config)
 
+    @property
+    def port(self):
+        return self.config.port
+
+    @port.setter
+    def port(self, value):
+        self.config.port = value
+        self.uvicorn_server = uvicorn.Server(self.config)
+
+    def run(self, host=None, port=None, retries=5):
+        if host is not None:
+            self.host = host
+        if port is not None:
+            self.port = port
+
+        # Print server information
         if self.host == "0.0.0.0":
             print(
                 "Warning: Using host `0.0.0.0` will expose Open Interpreter over your local network."
             )
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))  # Google's public DNS server
-            print(f"Server is running at http://{s.getsockname()[0]}:{self.port}")
+            print(f"Server will run at http://{s.getsockname()[0]}:{self.port}")
             s.close()
+        else:
+            print(f"Server will run at http://{self.host}:{self.port}")
 
-        for _ in range(retries):
-            try:
-                uvicorn.run(
-                    app=self.app, host=self.host, port=self.port, *args, **kwargs
-                )
-                break
-            except KeyboardInterrupt:
-                break
-            except ImportError as e:
-                if _ == 4:  # If this is the last attempt
-                    raise ImportError(
-                        str(e)
-                        + """\n\nPlease ensure you have run `pip install "open-interpreter[server]"` to install server dependencies."""
-                    )
-            except:
-                print("An unexpected error occurred:", traceback.format_exc())
-                print("SERVER RESTARTING")
-        print("SERVER SHUTDOWN")
+        self.uvicorn_server.run()
+
+        # for _ in range(retries):
+        #     try:
+        #         self.uvicorn_server.run()
+        #         break
+        #     except KeyboardInterrupt:
+        #         break
+        #     except ImportError as e:
+        #         if _ == 4:  # If this is the last attempt
+        #             raise ImportError(
+        #                 str(e)
+        #                 + """\n\nPlease ensure you have run `pip install "open-interpreter[server]"` to install server dependencies."""
+        #             )
+        #     except:
+        #         print("An unexpected error occurred:", traceback.format_exc())
+        #         print("Server restarting.")

@@ -40,6 +40,10 @@ def run_function_calling_llm(llm, request_params):
     accumulated_deltas = {}
     language = None
     code = ""
+    function_call_detected = False
+
+    accumulated_review = ""
+    review_category = None
 
     for chunk in llm.completions(**request_params):
         if "choices" not in chunk or len(chunk["choices"]) == 0:
@@ -47,18 +51,51 @@ def run_function_calling_llm(llm, request_params):
             continue
 
         delta = chunk["choices"][0]["delta"]
-
         # Accumulate deltas
         accumulated_deltas = merge_deltas(accumulated_deltas, delta)
 
         if "content" in delta and delta["content"]:
-            yield {"type": "message", "content": delta["content"]}
+            if function_call_detected:
+                # More content after a code block? This is a code review by a judge layer.
+
+                # print("Code safety review:", delta["content"])
+
+                if review_category == None:
+                    accumulated_review += delta["content"]
+
+                    if "<unsafe>" in accumulated_review:
+                        review_category = "unsafe"
+                    if "<warning>" in accumulated_review:
+                        review_category = "warning"
+                    if "<safe>" in accumulated_review:
+                        review_category = "safe"
+
+                if review_category != None:
+                    for tag in [
+                        "<safe>",
+                        "</safe>",
+                        "<warning>",
+                        "</warning>",
+                        "<unsafe>",
+                        "</unsafe>",
+                    ]:
+                        delta["content"] = delta["content"].replace(tag, "")
+
+                    yield {
+                        "type": "review",
+                        "format": review_category,
+                        "content": delta["content"],
+                    }
+
+            else:
+                yield {"type": "message", "content": delta["content"]}
 
         if (
             accumulated_deltas.get("function_call")
             and "arguments" in accumulated_deltas["function_call"]
             and accumulated_deltas["function_call"]["arguments"]
         ):
+            function_call_detected = True
             if (
                 "name" in accumulated_deltas["function_call"]
                 and accumulated_deltas["function_call"]["name"] == "execute"
